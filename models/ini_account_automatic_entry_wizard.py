@@ -17,7 +17,10 @@ class AutomaticEntryWizard(models.TransientModel):
                 line_data = line_tuple[2]
                 # Buscamos en la selección original una línea que coincida con la cuenta
                 source_line = self.move_line_ids.filtered(
-                    lambda l: l.account_id.id == line_data.get('account_id') and l.product_id
+                    lambda l: 
+                        l.account_id.id == line_data.get('account_id')
+                        and l.product_id
+                        and l.product_id == line_data.get('product_id') 
                 )[:1]
                 if source_line:
                     line_data['product_id'] = source_line.product_id.id
