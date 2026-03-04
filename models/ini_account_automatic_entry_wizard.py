@@ -39,15 +39,13 @@ class AutomaticEntryWizard(models.TransientModel):
             columns.insert(insert_idx, {'field': 'product_id', 'label': _('Product')})
 
             # Inject product names into preview line data
-            for group_idx, move in enumerate(move_vals[:4]):
-                if group_idx >= len(preview.get('groups_vals', [])):
-                    break
-                group = preview['groups_vals'][group_idx]
-                line_dicts = [l[2] for l in move.get('line_ids', [])]
-                for col_idx, line in enumerate(group.get('columns_vals', [])):
-                    if col_idx < len(line_dicts):
-                        pid = line_dicts[col_idx].get('product_id')
-                        line['product_id'] = product_names.get(pid, '')
+            for group in preview.get('groups_vals', []):
+                for line in group.get('columns_vals', []):
+                    pid = line.get('product_id')
+                    if isinstance(pid, int) and pid in product_names:
+                        line['product_id'] = product_names[pid]
+                    elif pid and pid not in product_names:
+                        line.setdefault('product_id', '')
 
             record.preview_move_data = json.dumps(preview)
 
@@ -102,7 +100,7 @@ class AutomaticEntryWizard(models.TransientModel):
                 'account_id': line.account_id.id,
                 'partner_id': line.partner_id.id or None,
                 'currency_id': line.currency_id.id,
-                'amount_currency': (1 if line.balance > 0 else -1) * abs(line.amount_currency),
+                'amount_currency': (-1 if line.balance > 0 else 1) * abs(line.amount_currency),
                 'analytic_distribution': line.analytic_distribution,
             }
             if line.product_id:
