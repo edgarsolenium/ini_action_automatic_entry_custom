@@ -1,50 +1,127 @@
-from odoo import models, api
+from odoo import api, models, fields, _
+
 import json
+
 
 class AutomaticEntryWizard(models.TransientModel):
     _inherit = 'account.automatic.entry.wizard'
 
-    def _get_move_dict_vals_change_account(self):
-        """ Sobreescribimos para incluir product_id en el traspaso de cuenta """
-        # Llamamos al original para obtener la estructura base
-        res = super(AutomaticEntryWizard, self)._get_move_dict_vals_change_account()
-        
-        # En este método, res[0]['line_ids'] contiene las líneas nuevas
-        # Como Odoo agrupa por partner/cuenta/moneda, buscamos el producto
-        # de las líneas originales para asignarlo a las nuevas líneas.
-        for move_vals in res:
-            for line_tuple in move_vals.get('line_ids', []):
-                line_data = line_tuple[2]
-                # Buscamos en la selección original una línea que coincida con la cuenta
-                source_line = self.move_line_ids.filtered(
-                    lambda l: 
-                        l.account_id.id == line_data.get('account_id')
-                        and l.product_id
-                        and l.partner_id.id == line_data.get('partner_id')
-                        and l.amount_currency == line_data.get('amount_currency')
-                )[:1]
-                if source_line:
-                    line_data['product_id'] = source_line.product_id.id
-        return res
+    @api.depends('move_data')
+    def _compute_preview_move_data(self):
+        super()._compute_preview_move_data()
+        for record in self:
+            preview = json.loads(record.preview_move_data)
+            move_vals = json.loads(record.move_data)
 
-    def _get_move_dict_vals_change_period(self):
-        """ Sobreescribimos para incluir product_id en el cambio de periodo """
-        # Obtenemos los valores generados por el estándar
-        res = super(AutomaticEntryWizard, self)._get_move_dict_vals_change_period()
-        
-        # Odoo genera múltiples movimientos en una lista. 
-        # Debemos recorrer cada movimiento y cada línea.
-        for move_vals in res:
-            for line_tuple in move_vals.get('line_ids', []):
-                line_data = line_tuple[2]
-                
-                # Intentamos encontrar el producto basado en la descripción o cuenta
-                # ya que en cambio de periodo la relación es 1 a 1 por línea.
-                source_line = self.move_line_ids.filtered(
-                    lambda l: (l.name == line_data.get('name') or l.account_id.id == line_data.get('account_id')) 
-                    and l.product_id
-                )[:1]
-                
-                if source_line:
-                    line_data['product_id'] = source_line.product_id.id
+            # Collect all product_ids from move lines and resolve names
+            product_ids = set()
+            for move in move_vals:
+                for (_mode, _id, line) in move.get('line_ids', []):
+                    pid = line.get('product_id')
+                    if pid:
+                        product_ids.add(pid)
+
+            if not product_ids:
+                continue
+
+            product_names = {
+                p.id: p.display_name
+                for p in self.env['product.product'].browse(list(product_ids))
+            }
+
+            # Add product column after 'name' (Label)
+            columns = preview.get('options', {}).get('columns', [])
+            # Find the index after 'name' to insert
+            insert_idx = next(
+                (i + 1 for i, c in enumerate(columns) if c.get('field') == 'name'),
+                len(columns),
+            )
+            columns.insert(insert_idx, {'field': 'product_id', 'label': _('Product')})
+
+            # Inject product names into preview line data
+            for group_idx, move in enumerate(move_vals[:4]):
+                if group_idx >= len(preview.get('groups_vals', [])):
+                    break
+                group = preview['groups_vals'][group_idx]
+                line_dicts = [l[2] for l in move.get('line_ids', [])]
+                for col_idx, line in enumerate(group.get('columns_vals', [])):
+                    if col_idx < len(line_dicts):
+                        pid = line_dicts[col_idx].get('product_id')
+                        line['product_id'] = product_names.get(pid, '')
+
+            record.preview_move_data = json.dumps(preview)
+
+    def _get_move_dict_vals_change_account(self):
+        """Override to avoid grouping lines by partner — create a 1-to-1
+        correspondence between original lines and new entry lines, and
+        carry over product_id."""
+        line_vals = []
+
+        for line in self.move_line_ids.filtered(lambda x: x.account_id != self.destination_account_id):
+            counterpart_currency = line.currency_id
+            counterpart_amount_currency = line.amount_currency
+
+            if self.destination_account_id.currency_id and self.destination_account_id.currency_id != self.company_id.currency_id:
+                counterpart_currency = self.destination_account_id.currency_id
+                counterpart_amount_currency = self.company_id.currency_id._convert(
+                    line.balance, self.destination_account_id.currency_id, self.company_id, line.date,
+                )
+
+            if counterpart_currency.is_zero(counterpart_amount_currency) and self.company_id.currency_id.is_zero(line.balance):
+                continue
+
+            source_accounts = self.move_line_ids.mapped('account_id')
+            counterpart_label = (
+                _("Transfer from %s", source_accounts.display_name)
+                if len(source_accounts) == 1
+                else _("Transfer counterpart")
+            )
+
+            # Counterpart line (destination account)
+            counterpart_vals = {
+                'name': counterpart_label,
+                'debit': self.company_id.currency_id.round(line.balance) if line.balance > 0 else 0,
+                'credit': self.company_id.currency_id.round(-line.balance) if line.balance < 0 else 0,
+                'account_id': self.destination_account_id.id,
+                'partner_id': line.partner_id.id or None,
+                'amount_currency': counterpart_currency.round(
+                    ((-1 if line.balance < 0 else 1) * abs(counterpart_amount_currency))
+                ) or 0,
+                'currency_id': counterpart_currency.id,
+                'analytic_distribution': line.analytic_distribution,
+            }
+            if line.product_id:
+                counterpart_vals['product_id'] = line.product_id.id
+            line_vals.append(counterpart_vals)
+
+            # Source line (original account, reversed)
+            source_vals = {
+                'name': _('Transfer to %s', self.destination_account_id.display_name or _('[Not set]')),
+                'debit': self.company_id.currency_id.round(-line.balance) if line.balance < 0 else 0,
+                'credit': self.company_id.currency_id.round(line.balance) if line.balance > 0 else 0,
+                'account_id': line.account_id.id,
+                'partner_id': line.partner_id.id or None,
+                'currency_id': line.currency_id.id,
+                'amount_currency': (1 if line.balance > 0 else -1) * abs(line.amount_currency),
+                'analytic_distribution': line.analytic_distribution,
+            }
+            if line.product_id:
+                source_vals['product_id'] = line.product_id.id
+            line_vals.append(source_vals)
+
+        return [{
+            'currency_id': self.journal_id.currency_id.id or self.journal_id.company_id.currency_id.id,
+            'move_type': 'entry',
+            'journal_id': self.journal_id.id,
+            'date': fields.Date.to_string(self.date),
+            'ref': _("Transfer entry to %s", self.destination_account_id.display_name or ''),
+            'line_ids': [(0, 0, line) for line in line_vals],
+        }]
+
+    def _get_move_line_dict_vals_change_period(self, aml, date):
+        """Override to carry over product_id in change period entries."""
+        res = super()._get_move_line_dict_vals_change_period(aml, date)
+        if aml.product_id:
+            for _mode, _id, vals in res:
+                vals['product_id'] = aml.product_id.id
         return res
