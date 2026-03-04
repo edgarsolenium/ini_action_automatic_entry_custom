@@ -20,7 +20,8 @@ class AutomaticEntryWizard(models.TransientModel):
                     lambda l: 
                         l.account_id.id == line_data.get('account_id')
                         and l.product_id
-                        and l.product_id == line_data.get('product_id') 
+                        and l.partner_id.id == line_data.get('partner_id')
+                        and l.amount_currency == line_data.get('amount_currency')
                 )[:1]
                 if source_line:
                     line_data['product_id'] = source_line.product_id.id
